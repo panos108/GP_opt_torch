@@ -50,7 +50,7 @@ def g_known(x):
     return x[0] + ca.sin(x[1]) - 1
 
 def fun_eval(x):
-    return f1(x), [g1(x)]
+    return f1(x)#, []
 
 lower = np.array([0.0]*2)
 upper = np.array([1.]*2)
@@ -59,8 +59,8 @@ X = np.random.rand(4, 2)
 Y = np.array([[f1(X[i]) for i in range(4)], [g1(X[i]) for i in range(4)]]).T
 
 solution = BayesOpt().solve(objective=fun_eval, xo=lower, bounds=(lower, upper),
-                            maxfun=10, N_constraints=1, casadi=True, print_iteration=True,
+                            maxfun=10, N_constraints=None, casadi=True, print_iteration=True,
                             known_constraints=[g_known], idx_integer=[1],
-                            select_kernel='Matern52')
+                            select_kernel='Matern52',acquisition='LCB')
 
 print(2)

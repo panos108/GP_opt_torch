@@ -11,8 +11,10 @@ import numpy as np
 from scipy.spatial.distance import cdist
 from casadi import *
 import botorch
-from botorch import fit_gpytorch_model
-from botorch.models import SingleTaskGP
+import gpytorch
+from botorch import fit_gpytorch_model, fit_gpytorch_mll, fit_fully_bayesian_model_nuts
+from botorch import fit, acquisition, optim
+import botorch.models as gp_models
 from botorch.optim import optimize_acqf
 from botorch.acquisition import UpperConfidenceBound
 from botorch.utils import draw_sobol_samples
@@ -24,13 +26,16 @@ from gpytorch.models import ExactGP
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.priors.torch_priors import GammaPrior
 from botorch.acquisition import ExpectedImprovement
-from pymoo.model.problem import Problem
-from pymoo.algorithms.nsga2 import NSGA2
-from pymoo.factory import get_performance_indicator
+# from pymoo.model.problem import Problem
+# from pymoo.algorithms.nsga2 import NSGA2
+# from pymoo.factory import get_performance_indicator
 from pymoo.optimize import minimize as pymoo_minimize
 from pymoo.util import plotting
 from pymoo.util.misc import stack
 from pymoo.visualization.scatter import Scatter
+import pymoo
+import pymoo.optimize
+from pymoo.core.mixed import MixedVariableGA
 
 np.random.seed(0)
 torch.seed()
@@ -43,14 +48,18 @@ def custom_formatwarning(msg, *args, **kwargs):
 
 class BayesOpt(object):
     def __init__(self):
-        pyro.get_param_store().clear()
+        # torch.manual_seed(42)  # Set seed for PyTorch
+        #
+        # botorch.utils.sampling.manual_seed(42)  # Set seed for BoTorch
+
+        # pyro.get_param_store().clear()
         self.obj_none_flag = False  # Added flag variable
         print('Start Bayesian Optimization using Torch')
 
     def solve(self, objective=None, xo=None, bounds=(0, 1), maxfun=20, N_initial=5,
               select_kernel='Matern32', acquisition='LCB', casadi=False, N_constraints=None,
               probabilistic=False, print_iteration=False, X_initial=None, Y_initial=None,
-              known_constraints=None, idx_integer=None):
+              known_constraints=None, idx_integer=None, gp_model_choise=None):
 
         """
         :param objective:           Objective function with numpy inputs
@@ -102,6 +111,8 @@ class BayesOpt(object):
         self.probabilistic = probabilistic
         self.print_iter = print_iteration
         self.known_constraints = known_constraints
+
+
 
         if objective is None:
             self.obj_none_flag = True
@@ -156,6 +167,11 @@ class BayesOpt(object):
         if self.idx_integer:
             self.X[..., idx_integer] = torch.round(self.X[..., idx_integer])
 
+        if gp_model_choise is None:
+            self.gp_model_choise = gp_models.SingleTaskGP
+        else:
+            self.gp_model_choise = gp_model_choise
+
         sol = self.run_main()
         return sol
 
@@ -179,7 +195,6 @@ class BayesOpt(object):
         :return:   Defined GP
         :rtype:    pyro object
         """
-        pyro.get_param_store().clear()
         Y_unscaled = self.Y
         X_unscaled = self.X
         nx = self.nx
@@ -196,32 +211,35 @@ class BayesOpt(object):
 
         X, Y = self.X_norm, self.Y_norm
 
+
+
+
         if self.kernel == 'Matern52':
             if not self.idx_integer:
-                gp_kernel = gp.kernels.Matern52(input_dim=nx, lengthscale=torch.ones(nx))
+                gp_kernel = MaternKernel(nu=5/2, input_dim=nx, lengthscale=torch.ones(nx), ard_num_dims=nx)
             else:
                 gp_kernel = MixedMatern52(input_dim=nx, lengthscale=torch.ones(nx), integer_dims=self.idx_integer)
 
         elif self.kernel == 'Matern32':
             if not self.idx_integer:
-                gp_kernel = gp.kernels.Matern32(input_dim=nx, lengthscale=torch.ones(nx))
+                gp_kernel = MaternKernel(nu=3/2, input_dim=nx, lengthscale=torch.ones(nx), ard_num_dims=nx)
             else:
                 gp_kernel = MixedMatern32(input_dim=nx, lengthscale=torch.ones(nx), integer_dims=self.idx_integer)
 
         elif self.kernel == 'RBF':
             if not self.idx_integer:
-                gp_kernel = gp.kernels.RBF(input_dim=nx, lengthscale=torch.ones(nx))
+                gp_kernel = RBFKernel(input_dim=nx, lengthscale=torch.ones(nx), ard_num_dims=nx)
             else:
                 gp_kernel = MixedRBF(input_dim=nx, lengthscale=torch.ones(nx), integer_dims=self.idx_integer)
 
         else:
             print('NOT IMPLEMENTED KERNEL, USE RBF INSTEAD')
             if not self.idx_integer:
-                gp_kernel = gp.kernels.RBF(input_dim=nx, lengthscale=torch.ones(nx))
+                gp_kernel = RBFKernel(input_dim=nx, lengthscale=torch.ones(nx), ard_num_dims=nx)
             else:
                 gp_kernel = MixedRBF(input_dim=nx, lengthscale=torch.ones(nx), integer_dims=self.idx_integer)
 
-        gpmodel = SingleTaskGP(self.X, self.Y[:, 0], kernel=gp_kernel)
+        gpmodel = self.gp_model_choise( X, Y[:, [i]], covar_module=gp_kernel)
 
         return gpmodel
 
@@ -282,8 +300,12 @@ class BayesOpt(object):
         gp_m.set_train_data(inputs=X, targets=y, strict=False)
 
         # Optimize the GP hyperparameters
-        mll = ExactMarginalLogLikelihood(gp_m.likelihood, gp_m)
-        fit_gpytorch_model(mll)
+        if self.gp_model_choise==botorch.models.SaasFullyBayesianSingleTaskGP:
+            fit_fully_bayesian_model_nuts(self.gp_model_choise)
+        else:
+
+            mll = ExactMarginalLogLikelihood(gp_m.likelihood, gp_m)
+            fit_gpytorch_mll(mll)
 
         return gp_m
 
@@ -449,47 +471,6 @@ class BayesOpt(object):
             ac = 0
         return ac
 
-    def find_a_candidate(self, x_init):
-        # Transform x to an unconstrained domain
-        constraint = constraints.interval(torch.from_numpy(self.bounds[0]).type(torch.FloatTensor),
-                                          torch.from_numpy(self.bounds[1]).type(torch.FloatTensor))
-        u_init = x_init.data.numpy()
-
-        # Define the objective function
-        def objective_function(u):
-            # ... (your objective function code here)
-            return obj
-
-        # Convert to PyTorch tensors
-        u_init = torch.from_numpy(u_init)
-        u_init.requires_grad = True
-
-        # Define the optimization closure
-        def closure():
-            optimizer.zero_grad()
-            loss = objective_function(u_init)
-            loss.backward()
-            return loss
-
-        # Perform optimization using LBFGS
-        optimizer = LBFGS([u_init], max_iter=1000, tolerance_grad=1e-8, line_search_fn='strong_wolfe')
-        optimizer.step(closure)
-
-        # Get the optimized solution
-        x_optimized = u_init.detach().numpy()
-
-        # Optional: You can get other diagnostics from the optimizer if needed
-        optimizer_state = optimizer.state
-        optimizer_state.pop('func_evals')  # remove func_evals from state as it's not needed
-
-        # Optional: You can return additional information if needed
-        result_info = {
-            'x_optimized': x_optimized,
-            'optimizer_state': optimizer_state,
-            # Add other information as needed
-        }
-
-        return x_optimized, result_info
 
     def find_a_candidate_pymoo(self):
 
